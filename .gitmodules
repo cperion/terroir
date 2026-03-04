@@ -1,0 +1,3 @@
+[submodule "/home/cedric/dev/terroir/deps/terra"]
+	path = /home/cedric/dev/terroir/deps/terra
+	url = https://github.com/terralang/terra.git
