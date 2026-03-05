@@ -42,7 +42,7 @@ local ArrowArray = arrow.ArrowArray
 -- Variable-length slice returned by utf8/binary/fixed_binary accessors
 struct arrow.Slice {
   data: &uint8
-  len: int32
+  len: int64
 }
 
 local Slice = arrow.Slice
@@ -476,7 +476,7 @@ local function varlen_type(id, format, offset_type)
         var data = [&uint8]([batch_sym].buffers[2])
         var idx = [row_sym] + [batch_sym].offset
         var start = offsets[idx]
-        var slen = [int32](offsets[idx + 1] - start)
+        var slen = [int64](offsets[idx + 1] - start)
       in
         Slice { data + start, slen }
       end
@@ -1159,12 +1159,22 @@ function arrow.gen_and_filter(left_gen, right_gen)
     return quote
       var n = [batch_sym].length
       var n_blocks = (n + 63) / 64
-      var left_mask: uint64[1024]
-      var right_mask: uint64[1024]
-      [left_gen(batch_sym, `&left_mask[0])]
-      [right_gen(batch_sym, `&right_mask[0])]
-      for block = 0, n_blocks do
-        [mask_sym][block] = left_mask[block] and right_mask[block]
+      var left_mask = [&uint64](C.calloc(n_blocks, sizeof(uint64)))
+      var right_mask = [&uint64](C.calloc(n_blocks, sizeof(uint64)))
+      if left_mask == nil or right_mask == nil then
+        if left_mask ~= nil then C.free(left_mask) end
+        if right_mask ~= nil then C.free(right_mask) end
+        for block = 0, n_blocks do
+          [mask_sym][block] = 0
+        end
+      else
+        [left_gen(batch_sym, `left_mask)]
+        [right_gen(batch_sym, `right_mask)]
+        for block = 0, n_blocks do
+          [mask_sym][block] = left_mask[block] and right_mask[block]
+        end
+        C.free(left_mask)
+        C.free(right_mask)
       end
     end
   end
@@ -1175,12 +1185,22 @@ function arrow.gen_or_filter(left_gen, right_gen)
     return quote
       var n = [batch_sym].length
       var n_blocks = (n + 63) / 64
-      var left_mask: uint64[1024]
-      var right_mask: uint64[1024]
-      [left_gen(batch_sym, `&left_mask[0])]
-      [right_gen(batch_sym, `&right_mask[0])]
-      for block = 0, n_blocks do
-        [mask_sym][block] = left_mask[block] or right_mask[block]
+      var left_mask = [&uint64](C.calloc(n_blocks, sizeof(uint64)))
+      var right_mask = [&uint64](C.calloc(n_blocks, sizeof(uint64)))
+      if left_mask == nil or right_mask == nil then
+        if left_mask ~= nil then C.free(left_mask) end
+        if right_mask ~= nil then C.free(right_mask) end
+        for block = 0, n_blocks do
+          [mask_sym][block] = 0
+        end
+      else
+        [left_gen(batch_sym, `left_mask)]
+        [right_gen(batch_sym, `right_mask)]
+        for block = 0, n_blocks do
+          [mask_sym][block] = left_mask[block] or right_mask[block]
+        end
+        C.free(left_mask)
+        C.free(right_mask)
       end
     end
   end
@@ -1191,10 +1211,24 @@ function arrow.gen_not_filter(inner_gen)
     return quote
       var n = [batch_sym].length
       var n_blocks = (n + 63) / 64
-      var inner_mask: uint64[1024]
-      [inner_gen(batch_sym, `&inner_mask[0])]
-      for block = 0, n_blocks do
-        [mask_sym][block] = not inner_mask[block]
+      var inner_mask = [&uint64](C.calloc(n_blocks, sizeof(uint64)))
+      if inner_mask == nil then
+        for block = 0, n_blocks do
+          [mask_sym][block] = 0
+        end
+      else
+        [inner_gen(batch_sym, `inner_mask)]
+        for block = 0, n_blocks do
+          [mask_sym][block] = not inner_mask[block]
+        end
+        if n_blocks > 0 then
+          var valid_bits = n and 63
+          if valid_bits ~= 0 then
+            var tail_mask = ([uint64](1) << valid_bits) - 1
+            [mask_sym][n_blocks - 1] = [mask_sym][n_blocks - 1] and tail_mask
+          end
+        end
+        C.free(inner_mask)
       end
     end
   end

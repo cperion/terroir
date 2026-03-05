@@ -495,7 +495,7 @@ do
   local schema = {{ name = "val", type = "binary" }}
   local reader = arrow.gen_reader(schema)
 
-  local read_len = terra(batch: &ArrowArray, row: int64) : int32
+  local read_len = terra(batch: &ArrowArray, row: int64) : int64
     var s = [reader.get.val(`@batch, row)]
     return s.len
   end
@@ -790,11 +790,76 @@ do
 
   local ptr = ffi.cast("void*", arr)
   local mask = run_filter(ptr)
-  -- >20: bits 1,2. NOT: bit 0 (and all higher bits set)
+  -- >20: bits 1,2. NOT: only bit 0 should be set.
   check("NOT: bit 0 (10) in", bit.band(mask, 1) ~= 0)
   check("NOT: bit 1 (25) out", bit.band(mask, 2) == 0)
   check("NOT: bit 2 (30) out", bit.band(mask, 4) == 0)
+  check("NOT: bit 3 (tail) out", bit.band(mask, 8) == 0)
   na.na_array_release(arr)
+end
+
+do
+  -- Large batch (> 1024 mask blocks) to exercise dynamic filter scratch buffers.
+  local n = 70000
+  local n_blocks = math.floor((n + 63) / 64)
+
+  local arr = ffi.new("struct ArrowArray")
+  local bufs = ffi.new("const void*[2]")
+  local vals = ffi.new("int32_t[?]", n)
+  for i = 0, n - 1 do vals[i] = i end
+  bufs[0] = nil
+  bufs[1] = vals
+  arr.length = n
+  arr.null_count = 0
+  arr.offset = 0
+  arr.n_buffers = 2
+  arr.n_children = 0
+  arr.buffers = bufs
+  arr.children = nil
+  arr.dictionary = nil
+
+  local schema = {{ name = "val", type = "int32" }}
+  local gt = arrow.gen_compare_filter(schema, "val", ">", 69990)
+  local lt = arrow.gen_compare_filter(schema, "val", "<", 70000)
+  local andf = arrow.gen_and_filter(gt, lt)
+  local orf = arrow.gen_or_filter(arrow.gen_compare_filter(schema, "val", "<", 2),
+                                  arrow.gen_compare_filter(schema, "val", ">", 69998))
+  local notf = arrow.gen_not_filter(gt)
+
+  local run_filter = terra(batch: &ArrowArray, out_first: &uint64, out_last: &uint64, which: int32)
+    var mask: uint64[ [n_blocks] ]
+    if which == 0 then
+      [andf(`@batch, `&mask[0])]
+    elseif which == 1 then
+      [orf(`@batch, `&mask[0])]
+    else
+      [notf(`@batch, `&mask[0])]
+    end
+    out_first[0] = mask[0]
+    out_last[0] = mask[ [n_blocks - 1] ]
+  end
+
+  local has_bit = terra(v: uint64, i: int32) : bool
+    return (v and ([uint64](1) << i)) ~= 0
+  end
+
+  local first = ffi.new("uint64_t[1]")
+  local last = ffi.new("uint64_t[1]")
+  local ptr = to_terra_ptr(arr)
+
+  run_filter(ptr, first, last, 0)
+  check("AND large: row69999 in", has_bit(last[0], 47))
+  check("AND large: row69990 out", not has_bit(last[0], 38))
+
+  run_filter(ptr, first, last, 1)
+  check("OR large: row0 in", has_bit(first[0], 0))
+  check("OR large: row1 in", has_bit(first[0], 1))
+  check("OR large: row69999 in", has_bit(last[0], 47))
+
+  run_filter(ptr, first, last, 2)
+  check("NOT large: row69999 out", not has_bit(last[0], 47))
+  check("NOT large: row69990 in", has_bit(last[0], 38))
+  check("NOT large: trailing bit48 out", not has_bit(last[0], 48))
 end
 
 -- ============================================================
@@ -1044,7 +1109,7 @@ do
   local schema = {{ name = "val", type = "large_binary" }}
   local reader = arrow.gen_reader(schema)
 
-  local read_len = terra(batch: &ArrowArray, row: int64) : int32
+  local read_len = terra(batch: &ArrowArray, row: int64) : int64
     var s = [reader.get.val(`@batch, row)]
     return s.len
   end
@@ -1063,6 +1128,35 @@ do
   check("large_binary: byte [1][0] = 0xDE", read_byte(ptr, 1, 0) == 0xDE)
   check("large_binary: byte [2][0] = 0xFF", read_byte(ptr, 2, 0) == 0xFF)
   na.na_array_release(arr)
+end
+
+do
+  -- Large-binary length should preserve 64-bit offset deltas.
+  local huge = 3000000000
+  local arr = ffi.new("struct ArrowArray")
+  local bufs = ffi.new("const void*[3]")
+  local offs = ffi.new("int64_t[2]", {0, huge})
+  local data = ffi.new("uint8_t[1]", {0})
+  bufs[0] = nil
+  bufs[1] = offs
+  bufs[2] = data
+  arr.length = 1
+  arr.null_count = 0
+  arr.offset = 0
+  arr.n_buffers = 3
+  arr.n_children = 0
+  arr.buffers = bufs
+  arr.children = nil
+  arr.dictionary = nil
+
+  local reader = arrow.gen_reader({{ name = "val", type = "large_binary" }})
+  local read_len = terra(batch: &ArrowArray, row: int64) : int64
+    var s = [reader.get.val(`@batch, row)]
+    return s.len
+  end
+
+  local ptr = to_terra_ptr(arr)
+  check("large_binary: len preserves int64", read_len(ptr, 0) == huge)
 end
 
 -- ============================================================
@@ -2141,7 +2235,7 @@ do
   local r64 = arrow.gen_reader({{ name = "d", type = T.decimal64(18, 3) }})
   local r128 = arrow.gen_reader({{ name = "d", type = T.decimal128(38, 6) }})
   local r256 = arrow.gen_reader({{ name = "d", type = T.decimal256(76, 0) }})
-  local read_len32 = terra(batch: &ArrowArray, row: int64) : int32
+  local read_len32 = terra(batch: &ArrowArray, row: int64) : int64
     var s = [r32.get.d(`@batch, row)]
     return s.len
   end
@@ -2149,7 +2243,7 @@ do
     var s = [r32.get.d(`@batch, row)]
     return s.data[i]
   end
-  local read_len256 = terra(batch: &ArrowArray, row: int64) : int32
+  local read_len256 = terra(batch: &ArrowArray, row: int64) : int64
     var s = [r256.get.d(`@batch, row)]
     return s.len
   end
@@ -2157,11 +2251,11 @@ do
     var s = [r256.get.d(`@batch, row)]
     return s.data[i]
   end
-  local read_len64 = terra(batch: &ArrowArray, row: int64) : int32
+  local read_len64 = terra(batch: &ArrowArray, row: int64) : int64
     var s = [r64.get.d(`@batch, row)]
     return s.len
   end
-  local read_len128 = terra(batch: &ArrowArray, row: int64) : int32
+  local read_len128 = terra(batch: &ArrowArray, row: int64) : int64
     var s = [r128.get.d(`@batch, row)]
     return s.len
   end
@@ -2216,7 +2310,7 @@ do
   arr.dictionary = nil
 
   local reader = arrow.gen_reader({{ name = "sv", type = T.string_view }})
-  local read_len = terra(batch: &ArrowArray, row: int64) : int32
+  local read_len = terra(batch: &ArrowArray, row: int64) : int64
     var s = [reader.get.sv(`@batch, row)]
     return s.len
   end
@@ -2252,7 +2346,7 @@ do
   arr.buffers = bufs
 
   local reader = arrow.gen_reader({{ name = "bv", type = T.binary_view }})
-  local read_len = terra(batch: &ArrowArray, row: int64) : int32
+  local read_len = terra(batch: &ArrowArray, row: int64) : int64
     var s = [reader.get.bv(`@batch, row)]
     return s.len
   end
