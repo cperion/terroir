@@ -9,6 +9,9 @@ local Cstdio = terralib.includec("stdio.h")
 local Cunistd = terralib.includec("unistd.h")
 local Ctime = terralib.includec("time.h")
 local Cfcntl = terralib.includec("fcntl.h")
+local Csched = terralib.includec("sched.h")
+local Csocket = terralib.includec("sys/socket.h")
+local Cdir = terralib.includec("dirent.h")
 
 local POT = {}
 
@@ -2490,23 +2493,81 @@ end
 -- WASI Preview 1
 ------------------------------------------------------------------------
 
-local function make_wasi(mod, module_env, wasi_args)
+local function make_wasi(mod, module_env, wasi_args, wasi_env, wasi_dirs)
     local mem = module_env.memory_sym
     local mem_size = module_env.mem_size
     local wasi = {}
     local P = "wasi_snapshot_preview1."
+    local WASI_ERRNO_BADF = 8
+    local WASI_ERRNO_INVAL = 28
+    local WASI_ERRNO_IO = 29
+    local WASI_ERRNO_NOENT = 44
+    local WASI_ERRNO_NOSYS = 52
+    local WASI_ERRNO_NOTSOCK = 57
+    local trace_wasi = os.getenv("POT_WASI_TRACE") == "1"
+    local n_dirs = #(wasi_dirs or {})
+    local dir_strs = {}
+    local dir_hosts = {}
+    for i = 1, n_dirs do
+        local d = wasi_dirs[i]
+        if type(d) == "table" and d.guest ~= nil then
+            dir_strs[i] = tostring(d.guest)
+            dir_hosts[i] = tostring(d.host or d.guest)
+        else
+            dir_strs[i] = tostring(d)
+            dir_hosts[i] = tostring(d)
+        end
+    end
+    local dir_constants = {}
+    local dir_host_constants = {}
+    for i = 1, n_dirs do
+        dir_constants[i] = global(int8[#dir_strs[i]])
+        local init = terralib.new(int8[#dir_strs[i]])
+        for j = 1, #dir_strs[i] do
+            init[j - 1] = dir_strs[i]:byte(j)
+        end
+        dir_constants[i]:set(init)
+
+        dir_host_constants[i] = global(int8[#dir_hosts[i] + 1])
+        local hinit = terralib.new(int8[#dir_hosts[i] + 1])
+        for j = 1, #dir_hosts[i] do
+            hinit[j - 1] = dir_hosts[i]:byte(j)
+        end
+        hinit[#dir_hosts[i]] = 0
+        dir_host_constants[i]:set(hinit)
+    end
+    local dot_path = global(int8[2])
+    do
+        local init = terralib.new(int8[2])
+        init[0] = 46 -- '.'
+        init[1] = 0
+        dot_path:set(init)
+    end
+    -- Small ring cache to keep readdir-provided inode values consistent with
+    -- immediate fstatat(path) calls from libc wrappers.
+    local ino_cache_cap = 4096
+    local ino_cache_fd = global(int32[ino_cache_cap])
+    local ino_cache_hash = global(uint64[ino_cache_cap])
+    local ino_cache_ino = global(uint64[ino_cache_cap])
+    local ino_cache_count = global(uint32[1])
+    local fd_ino_cap = 4096
+    local fd_ino_fd = global(int32[fd_ino_cap])
+    local fd_ino_ino = global(uint64[fd_ino_cap])
+    local fd_ino_count = global(uint32[1])
 
     -- fd_write(fd, iovs, iovs_len, nwritten) -> errno
     wasi[P .. "fd_write"] = terra(
         fd: int32, iovs_ptr: int32, iovs_len: int32, nwritten_ptr: int32
     ) : int32
+        if fd < 0 then return WASI_ERRNO_BADF end
+        if Cfcntl.fcntl(fd, Cfcntl.F_GETFD) < 0 then return WASI_ERRNO_BADF end
         var total : int32 = 0
         for i = 0, iovs_len do
             var base = mem + [uint64]([uint32](iovs_ptr)) + [uint64](i) * 8
             var buf_off = @[&uint32](base)
             var buf_len = @[&uint32](base + 4)
             var written = Cunistd.write(fd, mem + [uint64](buf_off), buf_len)
-            if written < 0 then return 29 end -- ENOSYS-ish
+            if written < 0 then return WASI_ERRNO_IO end
             total = total + [int32](written)
         end
         @[&int32](mem + [uint64]([uint32](nwritten_ptr))) = total
@@ -2523,7 +2584,7 @@ local function make_wasi(mod, module_env, wasi_args)
             var buf_off = @[&uint32](base)
             var buf_len = @[&uint32](base + 4)
             var n = Cunistd.read(fd, mem + [uint64](buf_off), buf_len)
-            if n < 0 then return 29 end
+            if n < 0 then return WASI_ERRNO_IO end
             total = total + [int32](n)
             if n < [int64](buf_len) then break end
         end
@@ -2533,7 +2594,7 @@ local function make_wasi(mod, module_env, wasi_args)
 
     -- fd_close(fd) -> errno
     wasi[P .. "fd_close"] = terra(fd: int32) : int32
-        if Cunistd.close(fd) < 0 then return 8 end
+        if Cunistd.close(fd) < 0 then return WASI_ERRNO_BADF end
         return 0
     end
 
@@ -2542,7 +2603,15 @@ local function make_wasi(mod, module_env, wasi_args)
         fd: int32, offset: int64, whence: int32, newoffset_ptr: int32
     ) : int32
         var result = Cunistd.lseek(fd, offset, whence)
-        if result < 0 then return 29 end
+        if result < 0 then return WASI_ERRNO_IO end
+        @[&int64](mem + [uint64]([uint32](newoffset_ptr))) = result
+        return 0
+    end
+
+    -- fd_tell(fd, newoffset_ptr) -> errno
+    wasi[P .. "fd_tell"] = terra(fd: int32, newoffset_ptr: int32) : int32
+        var result = Cunistd.lseek(fd, 0, Cunistd.SEEK_CUR)
+        if result < 0 then return WASI_ERRNO_IO end
         @[&int64](mem + [uint64]([uint32](newoffset_ptr))) = result
         return 0
     end
@@ -2552,24 +2621,62 @@ local function make_wasi(mod, module_env, wasi_args)
         var base = mem + [uint64]([uint32](buf_ptr))
         -- fdstat: u8 filetype, u16 flags, u64 rights_base, u64 rights_inheriting
         Cstr.memset(base, 0, 24)
-        if fd <= 2 then
+        if fd < 0 then
+            return WASI_ERRNO_BADF
+        elseif fd <= 2 then
             @[&uint8](base) = 2  -- CHARACTER_DEVICE
         else
-            @[&uint8](base) = 4  -- REGULAR_FILE
+            -- Temporary broad classification to keep libc dir/file helpers moving.
+            @[&uint8](base) = 3  -- DIRECTORY
         end
+        -- Liberal rights mask to avoid over-restricting libc helper paths.
+        @[&uint64](base + 8) = 0xFFFFFFFFFFFFFFFFULL
+        @[&uint64](base + 16) = 0xFFFFFFFFFFFFFFFFULL
         return 0
     end
 
-    -- fd_prestat_get(fd, buf) -> errno  (no preopened dirs)
+    -- fd_prestat_get(fd, buf) -> errno
     wasi[P .. "fd_prestat_get"] = terra(fd: int32, buf_ptr: int32) : int32
-        return 8 -- EBADF
+        if fd < 3 then return WASI_ERRNO_BADF end
+        var idx = fd - 3
+        if idx < 0 or idx >= [n_dirs] then return WASI_ERRNO_BADF end
+        var base = mem + [uint64]([uint32](buf_ptr))
+        Cstr.memset(base, 0, 8)
+        @[&uint8](base + 0) = 0 -- __WASI_PREOPENTYPE_DIR
+        escape
+            for i = 1, n_dirs do
+                local dlen = #dir_strs[i]
+                emit quote
+                    if idx == [i - 1] then
+                        @[&uint32](base + 4) = [uint32]([dlen])
+                    end
+                end
+            end
+        end
+        return 0
     end
 
     -- fd_prestat_dir_name(fd, path, len) -> errno
     wasi[P .. "fd_prestat_dir_name"] = terra(
         fd: int32, path_ptr: int32, path_len: int32
     ) : int32
-        return 8 -- EBADF
+        if fd < 3 then return WASI_ERRNO_BADF end
+        var idx = fd - 3
+        if idx < 0 or idx >= [n_dirs] then return WASI_ERRNO_BADF end
+        var base = mem + [uint64]([uint32](path_ptr))
+        escape
+            for i = 1, n_dirs do
+                local dlen = #dir_strs[i]
+                local dsrc = dir_constants[i]
+                emit quote
+                    if idx == [i - 1] then
+                        if path_len < [int32](dlen) then return WASI_ERRNO_INVAL end
+                        Cstr.memcpy(base, &dsrc, dlen)
+                    end
+                end
+            end
+        end
+        return 0
     end
 
     -- proc_exit(code)
@@ -2625,12 +2732,36 @@ local function make_wasi(mod, module_env, wasi_args)
         return 0
     end
 
+    -- env: bake Lua map into Terra constants as "k=v"
+    local env_items = {}
+    if type(wasi_env) == "table" then
+        for k, v in pairs(wasi_env) do
+            env_items[#env_items + 1] = tostring(k) .. "=" .. tostring(v)
+        end
+    end
+    table.sort(env_items)
+    local n_env = #env_items
+    local env_buf_total = 0
+    for i = 1, n_env do
+        env_buf_total = env_buf_total + #env_items[i] + 1
+    end
+    local env_constants = {}
+    for i = 1, n_env do
+        env_constants[i] = global(int8[#env_items[i] + 1])
+        local init = terralib.new(int8[#env_items[i] + 1])
+        for j = 1, #env_items[i] do
+            init[j - 1] = env_items[i]:byte(j)
+        end
+        init[#env_items[i]] = 0
+        env_constants[i]:set(init)
+    end
+
     -- environ_sizes_get(environc_ptr, environ_buf_size_ptr) -> errno
     wasi[P .. "environ_sizes_get"] = terra(
         environc_ptr: int32, buf_size_ptr: int32
     ) : int32
-        @[&int32](mem + [uint64]([uint32](environc_ptr))) = 0
-        @[&int32](mem + [uint64]([uint32](buf_size_ptr))) = 0
+        @[&int32](mem + [uint64]([uint32](environc_ptr))) = [int32](n_env)
+        @[&int32](mem + [uint64]([uint32](buf_size_ptr))) = [int32](env_buf_total)
         return 0
     end
 
@@ -2638,6 +2769,34 @@ local function make_wasi(mod, module_env, wasi_args)
     wasi[P .. "environ_get"] = terra(
         environ_ptr: int32, environ_buf_ptr: int32
     ) : int32
+        var env_base = mem + [uint64]([uint32](environ_ptr))
+        var buf_base = mem + [uint64]([uint32](environ_buf_ptr))
+        var buf_offset : int32 = 0
+        escape
+            if trace_wasi then
+                emit quote
+                    Cstdio.fprintf(Cstdio.stderr, "pot-wasi environ_get base=%d buf=%d\n",
+                        environ_ptr, environ_buf_ptr)
+                end
+            end
+        end
+        escape
+            for i = 1, n_env do
+                local slen = #env_items[i] + 1
+                local src = env_constants[i]
+                emit quote
+                    @[&int32](env_base + [uint64]((i - 1) * 4)) = environ_buf_ptr + buf_offset
+                    Cstr.memcpy(buf_base + [uint64](buf_offset), &src, slen)
+                    buf_offset = buf_offset + slen
+                end
+                if trace_wasi then
+                    emit quote
+                        Cstdio.fprintf(Cstdio.stderr, "pot-wasi environ_get[%d] ptr=%d len=%d\n",
+                            [int32](i - 1), environ_buf_ptr + (buf_offset - [int32](slen)), [int32](slen))
+                    end
+                end
+            end
+        end
         return 0
     end
 
@@ -2648,9 +2807,20 @@ local function make_wasi(mod, module_env, wasi_args)
         var ts : Ctime.timespec
         var clock_id : int32 = 0  -- CLOCK_REALTIME
         if id == 1 then clock_id = 1 end  -- CLOCK_MONOTONIC
-        if Ctime.clock_gettime(clock_id, &ts) ~= 0 then return 29 end
+        if Ctime.clock_gettime(clock_id, &ts) ~= 0 then return WASI_ERRNO_IO end
         var ns = [int64](ts.tv_sec) * 1000000000LL + [int64](ts.tv_nsec)
         @[&int64](mem + [uint64]([uint32](time_ptr))) = ns
+        return 0
+    end
+
+    -- clock_res_get(id, resolution_ptr) -> errno
+    wasi[P .. "clock_res_get"] = terra(id: int32, resolution_ptr: int32) : int32
+        var ts : Ctime.timespec
+        var clock_id : int32 = 0  -- CLOCK_REALTIME
+        if id == 1 then clock_id = 1 end  -- CLOCK_MONOTONIC
+        if Ctime.clock_getres(clock_id, &ts) ~= 0 then return WASI_ERRNO_IO end
+        var ns = [int64](ts.tv_sec) * 1000000000LL + [int64](ts.tv_nsec)
+        @[&int64](mem + [uint64]([uint32](resolution_ptr))) = ns
         return 0
     end
 
@@ -2658,9 +2828,466 @@ local function make_wasi(mod, module_env, wasi_args)
     wasi[P .. "random_get"] = terra(buf_ptr: int32, buf_len: int32) : int32
         var base = mem + [uint64]([uint32](buf_ptr))
         for i = 0, buf_len do
-            @[&uint8](base + i) = [uint8](C.rand() and 0xFF)
+            @[&uint8](base + i) = [uint8](C.rand() % 256)
         end
         return 0
+    end
+
+    -- fd_pread(fd, iovs, iovs_len, offset, nread) -> errno
+    wasi[P .. "fd_pread"] = terra(
+        fd: int32, iovs_ptr: int32, iovs_len: int32, off: int64, nread_ptr: int32
+    ) : int32
+        var total : int32 = 0
+        var cur : int64 = off
+        for i = 0, iovs_len do
+            var base = mem + [uint64]([uint32](iovs_ptr)) + [uint64](i) * 8
+            var buf_off = @[&uint32](base)
+            var buf_len = @[&uint32](base + 4)
+            var n = Cunistd.pread(fd, mem + [uint64](buf_off), buf_len, cur)
+            if n < 0 then return WASI_ERRNO_IO end
+            total = total + [int32](n)
+            cur = cur + n
+            if n < [int64](buf_len) then break end
+        end
+        @[&int32](mem + [uint64]([uint32](nread_ptr))) = total
+        return 0
+    end
+
+    -- fd_pwrite(fd, ciovs, ciovs_len, offset, nwritten) -> errno
+    wasi[P .. "fd_pwrite"] = terra(
+        fd: int32, iovs_ptr: int32, iovs_len: int32, off: int64, nwritten_ptr: int32
+    ) : int32
+        var total : int32 = 0
+        var cur : int64 = off
+        for i = 0, iovs_len do
+            var base = mem + [uint64]([uint32](iovs_ptr)) + [uint64](i) * 8
+            var buf_off = @[&uint32](base)
+            var buf_len = @[&uint32](base + 4)
+            var n = Cunistd.pwrite(fd, mem + [uint64](buf_off), buf_len, cur)
+            if n < 0 then return WASI_ERRNO_IO end
+            total = total + [int32](n)
+            cur = cur + n
+        end
+        @[&int32](mem + [uint64]([uint32](nwritten_ptr))) = total
+        return 0
+    end
+
+    -- sched_yield() -> errno
+    wasi[P .. "sched_yield"] = terra() : int32
+        if Csched.sched_yield() ~= 0 then return WASI_ERRNO_IO end
+        return 0
+    end
+
+    -- Remaining preview1 imports currently stubbed (return ENOSYS).
+    wasi[P .. "fd_fdstat_set_flags"] = terra(fd: int32, flags: uint16) : int32
+        -- Best-effort no-op to satisfy common libc expectations.
+        if fd < 0 then return WASI_ERRNO_BADF end
+        return 0
+    end
+    wasi[P .. "fd_fdstat_set_rights"] = terra(fd: int32, rights_base: uint64, rights_inh: uint64) : int32
+        -- Preview1 rights are advisory for many hosts; accept.
+        if fd < 0 then return WASI_ERRNO_BADF end
+        return 0
+    end
+    wasi[P .. "fd_filestat_get"] = terra(fd: int32, buf_ptr: int32) : int32
+        if fd < 0 then return WASI_ERRNO_BADF end
+        var base = mem + [uint64]([uint32](buf_ptr))
+        Cstr.memset(base, 0, 64)
+        -- dev
+        @[&uint64](base + 0) = 1ULL
+        -- ino: prefer inode captured during path_open/readdir flow.
+        var ino : uint64 = [uint64]([uint32](fd))
+        var total = fd_ino_count[0]
+        var scan : uint32 = 0
+        while scan < total and scan < [uint32](fd_ino_cap) do
+            var idx = (total - 1 - scan) % [uint32](fd_ino_cap)
+            if fd_ino_fd[idx] == fd then
+                ino = fd_ino_ino[idx]
+                break
+            end
+            scan = scan + 1
+        end
+        @[&uint64](base + 8) = ino
+        -- filetype regular
+        @[&uint8](base + 16) = 4
+        -- nlink
+        @[&uint64](base + 24) = 1ULL
+        -- size via tell/seek
+        var cur = Cunistd.lseek(fd, 0, Cunistd.SEEK_CUR)
+        var endp = Cunistd.lseek(fd, 0, Cunistd.SEEK_END)
+        if cur >= 0 and endp >= 0 then
+            @[&uint64](base + 32) = [uint64](endp)
+            Cunistd.lseek(fd, cur, Cunistd.SEEK_SET)
+        end
+        escape
+            if trace_wasi then
+                emit quote
+                    Cstdio.fprintf(Cstdio.stderr, "pot-wasi fd_filestat_get fd=%d ino=%llu size=%llu\n",
+                        fd, ino, @[&uint64](base + 32))
+                end
+            end
+        end
+        return 0
+    end
+    wasi[P .. "fd_filestat_set_size"] = terra(fd: int32, size: int64) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "fd_filestat_set_times"] = terra(fd: int32, atim: int64, mtim: int64, fst_flags: uint16) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "fd_readdir"] = terra(fd: int32, buf_ptr: int32, buf_len: int32, cookie: uint64, used_ptr: int32) : int32
+        if fd < 0 then return WASI_ERRNO_BADF end
+        var dfd = Cunistd.dup(fd)
+        if dfd < 0 then return WASI_ERRNO_BADF end
+        var dirp = Cdir.fdopendir(dfd)
+        if dirp == nil then
+            Cunistd.close(dfd)
+            return WASI_ERRNO_BADF
+        end
+        var ordinal : uint64 = 0ULL
+        while ordinal < cookie do
+            var skip = Cdir.readdir(dirp)
+            if skip == nil then break end
+            ordinal = ordinal + 1ULL
+        end
+
+        var out = mem + [uint64]([uint32](buf_ptr))
+        var cap = [uint32](buf_len)
+        var off : uint32 = 0
+        while true do
+            var ent = Cdir.readdir(dirp)
+            if ent == nil then break end
+
+            var nm = ent.d_name
+            var nmlen = [uint32](Cstr.strlen(nm))
+            var rec = 24 + nmlen
+            if off + rec > cap then break end
+
+            var base = out + [uint64](off)
+            var next_cookie = ordinal + 1ULL
+            var name_hash : uint64 = 1469598103934665603ULL
+            for k = 0, nmlen do
+                name_hash = name_hash * 131ULL + [uint64](@[&uint8](&nm[0] + k))
+            end
+            @[&uint64](base + 0) = next_cookie                 -- d_next
+            @[&uint64](base + 8) = [uint64](ent.d_ino)         -- d_ino
+            @[&uint32](base + 16) = nmlen                       -- d_namlen
+            var wasi_ft : uint8 = 0
+            if ent.d_type == [uint8](Cdir.DT_BLK) then
+                wasi_ft = 1
+            elseif ent.d_type == [uint8](Cdir.DT_CHR) then
+                wasi_ft = 2
+            elseif ent.d_type == [uint8](Cdir.DT_DIR) then
+                wasi_ft = 3
+            elseif ent.d_type == [uint8](Cdir.DT_REG) then
+                wasi_ft = 4
+            elseif ent.d_type == [uint8](Cdir.DT_LNK) then
+                wasi_ft = 7
+            else
+                wasi_ft = 0
+            end
+            @[&uint8](base + 20) = wasi_ft                      -- d_type
+            @[&uint8](base + 21) = 0
+            @[&uint8](base + 22) = 0
+            @[&uint8](base + 23) = 0
+            Cstr.memcpy(base + 24, &nm[0], nmlen)
+            var ci = ino_cache_count[0] % [uint32](ino_cache_cap)
+            ino_cache_fd[ci] = fd
+            ino_cache_hash[ci] = name_hash
+            ino_cache_ino[ci] = [uint64](ent.d_ino)
+            ino_cache_count[0] = ino_cache_count[0] + 1
+            escape
+                if trace_wasi then
+                    emit quote
+                        Cstdio.fprintf(Cstdio.stderr, "pot-wasi   entry name=%s nmlen=%u hash=%llu ino=%llu next=%llu\n",
+                            &nm[0], nmlen, name_hash, [uint64](ent.d_ino), next_cookie)
+                    end
+                end
+            end
+            off = off + rec
+            ordinal = ordinal + 1ULL
+        end
+        Cdir.closedir(dirp)
+        @[&uint32](mem + [uint64]([uint32](used_ptr))) = off
+        escape
+            if trace_wasi then
+                emit quote
+                    Cstdio.fprintf(Cstdio.stderr, "pot-wasi fd_readdir fd=%d cookie=%llu used=%u\n",
+                        fd, cookie, off)
+                end
+            end
+        end
+        return 0
+    end
+    wasi[P .. "fd_renumber"] = terra(from_fd: int32, to_fd: int32) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "fd_advise"] = terra(fd: int32, offset: int64, len: int64, advice: int32) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "fd_allocate"] = terra(fd: int32, offset: int64, len: int64) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "path_create_directory"] = terra(fd: int32, path_ptr: int32, path_len: int32) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "path_filestat_get"] = terra(fd: int32, flags: uint32, path_ptr: int32, path_len: int32, buf_ptr: int32) : int32
+        if fd < 0 then return WASI_ERRNO_BADF end
+        if path_len < 0 then return WASI_ERRNO_INVAL end
+        var p = mem + [uint64]([uint32](path_ptr))
+        var n = [uint32](path_len)
+        var pcopy = [&int8](C.malloc([uint64](n) + 1ULL))
+        if pcopy == nil then return WASI_ERRNO_IO end
+        Cstr.memcpy([&opaque](pcopy), [&opaque](p), n)
+        pcopy[n] = 0
+        var dirfd = fd
+        var open_path = pcopy
+        var need_close_dirfd = false
+        if fd >= 3 and fd < (3 + [n_dirs]) then
+            dirfd = -1
+            var idx = fd - 3
+            escape
+                for i = 1, n_dirs do
+                    local hsrc = dir_host_constants[i]
+                    emit quote
+                        if idx == [i - 1] then
+                            dirfd = Cfcntl.open(&hsrc[0], Cfcntl.O_RDONLY, 0)
+                        end
+                    end
+                end
+            end
+            if dirfd < 0 then
+                C.free(pcopy)
+                return WASI_ERRNO_IO
+            end
+            need_close_dirfd = true
+            if n > 0 and pcopy[0] == 47 then
+                if n == 1 then
+                    open_path = &dot_path[0]
+                else
+                    open_path = pcopy + 1
+                end
+            end
+        end
+        var probe_fd = Cfcntl.openat(dirfd, open_path, Cfcntl.O_RDONLY, 0)
+        if need_close_dirfd then
+            Cunistd.close(dirfd)
+        end
+        if probe_fd < 0 then
+            C.free(pcopy)
+            return WASI_ERRNO_NOENT
+        end
+        Cunistd.close(probe_fd)
+        C.free(pcopy)
+        var name_hash : uint64 = 1469598103934665603ULL
+        for i = 0, n do
+            name_hash = name_hash * 131ULL + [uint64](@[&uint8](p + i))
+        end
+        var ino : uint64 = name_hash
+        var total = ino_cache_count[0]
+        var scan : uint32 = 0
+        while scan < total and scan < [uint32](ino_cache_cap) do
+            var idx = (total - 1 - scan) % [uint32](ino_cache_cap)
+            if ino_cache_fd[idx] == fd and ino_cache_hash[idx] == name_hash then
+                ino = ino_cache_ino[idx]
+                break
+            end
+            scan = scan + 1
+        end
+        var base = mem + [uint64]([uint32](buf_ptr))
+        Cstr.memset(base, 0, 64)
+        @[&uint64](base + 0) = 1ULL          -- dev
+        @[&uint64](base + 8) = ino           -- ino
+        @[&uint8](base + 16) = 4             -- filetype regular
+        @[&uint64](base + 24) = 1ULL         -- nlink
+        @[&uint64](base + 32) = 0ULL         -- size unknown
+        escape
+            if trace_wasi then
+                emit quote
+                    Cstdio.fprintf(Cstdio.stderr, "pot-wasi path_filestat_get fd=%d path_len=%d hash=%llu ino=%llu\n",
+                        fd, path_len, name_hash, ino)
+                end
+            end
+        end
+        return 0
+    end
+    wasi[P .. "path_filestat_set_times"] = terra(fd: int32, flags: uint32, path_ptr: int32, path_len: int32, atim: int64, mtim: int64, fst_flags: uint16) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "path_link"] = terra(old_fd: int32, old_flags: uint32, old_path_ptr: int32, old_path_len: int32, new_fd: int32, new_path_ptr: int32, new_path_len: int32) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "path_open"] = terra(fd: int32, dirflags: uint32, path_ptr: int32, path_len: int32, oflags: uint16, rights_base: uint64, rights_inh: uint64, fdflags: uint16, opened_fd_ptr: int32) : int32
+        if path_len < 0 then return WASI_ERRNO_INVAL end
+        var n = [uint64]([uint32](path_len))
+        var p = [&int8](C.malloc(n + 1))
+        if p == nil then return WASI_ERRNO_IO end
+        Cstr.memcpy([&opaque](p), [&opaque](mem + [uint64]([uint32](path_ptr))), n)
+        p[n] = 0
+
+        var flags : int32 = Cfcntl.O_RDONLY
+        var needs_write : bool = false
+        if (oflags % 2) ~= 0 then
+            flags = flags + Cfcntl.O_CREAT
+            needs_write = true
+        end
+        -- WASI O_DIRECTORY hint ignored if host constant is unavailable.
+        -- WASI O_DIRECTORY hint ignored when host constant is unavailable.
+        if ((oflags / 4) % 2) ~= 0 then
+            flags = flags + Cfcntl.O_EXCL
+        end
+        if ((oflags / 8) % 2) ~= 0 then
+            flags = flags + Cfcntl.O_TRUNC
+            needs_write = true
+        end
+        if (fdflags % 2) ~= 0 then
+            flags = flags + Cfcntl.O_APPEND
+            needs_write = true
+        end
+        if needs_write then
+            flags = (flags - Cfcntl.O_RDONLY) + Cfcntl.O_RDWR
+        end
+
+        -- Map WASI preopen fd space to current process cwd by default.
+        var dirfd = fd
+        var open_path = p
+        var need_close_dirfd = false
+        if fd >= 3 and fd < (3 + [n_dirs]) then
+            dirfd = -1
+            var idx = fd - 3
+            escape
+                for i = 1, n_dirs do
+                    local hsrc = dir_host_constants[i]
+                    emit quote
+                        if idx == [i - 1] then
+                            dirfd = Cfcntl.open(&hsrc[0], Cfcntl.O_RDONLY, 0)
+                        end
+                    end
+                end
+            end
+            if dirfd < 0 then
+                C.free(p)
+                return WASI_ERRNO_IO
+            end
+            need_close_dirfd = true
+            if n > 0 and p[0] == 47 then -- '/'
+                if n == 1 then
+                    open_path = &dot_path[0]
+                else
+                    open_path = p + 1
+                end
+            end
+        end
+
+        var opened = Cfcntl.openat(dirfd, open_path, flags, 438) -- 0666
+        escape
+            if trace_wasi then
+                emit quote
+                    Cstdio.fprintf(Cstdio.stderr, "pot-wasi path_open fd=%d dirfd=%d path=%s flags=%d opened=%d\n",
+                        fd, dirfd, open_path, flags, opened)
+                end
+            end
+        end
+        if need_close_dirfd then
+            Cunistd.close(dirfd)
+        end
+        if opened >= 0 then
+            var name_hash : uint64 = 1469598103934665603ULL
+            var i : uint32 = 0
+            while open_path[i] ~= 0 do
+                name_hash = name_hash * 131ULL + [uint64](@[&uint8](open_path + i))
+                i = i + 1
+            end
+            var ino : uint64 = 0ULL
+            var found_ino = false
+            var total = ino_cache_count[0]
+            var scan : uint32 = 0
+            while scan < total and scan < [uint32](ino_cache_cap) do
+                var idx = (total - 1 - scan) % [uint32](ino_cache_cap)
+                if ino_cache_fd[idx] == fd and ino_cache_hash[idx] == name_hash then
+                    ino = ino_cache_ino[idx]
+                    found_ino = true
+                    break
+                end
+                scan = scan + 1
+            end
+            if found_ino then
+                var fi = fd_ino_count[0] % [uint32](fd_ino_cap)
+                fd_ino_fd[fi] = opened
+                fd_ino_ino[fi] = ino
+                fd_ino_count[0] = fd_ino_count[0] + 1
+            end
+        end
+        C.free(p)
+        if opened < 0 then return WASI_ERRNO_IO end
+        @[&int32](mem + [uint64]([uint32](opened_fd_ptr))) = opened
+        return 0
+    end
+    wasi[P .. "path_readlink"] = terra(fd: int32, path_ptr: int32, path_len: int32, buf_ptr: int32, buf_len: int32, used_ptr: int32) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "path_remove_directory"] = terra(fd: int32, path_ptr: int32, path_len: int32) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "path_rename"] = terra(old_fd: int32, old_path_ptr: int32, old_path_len: int32, new_fd: int32, new_path_ptr: int32, new_path_len: int32) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "path_symlink"] = terra(old_path_ptr: int32, old_path_len: int32, fd: int32, new_path_ptr: int32, new_path_len: int32) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "path_unlink_file"] = terra(fd: int32, path_ptr: int32, path_len: int32) : int32
+        if fd < 0 then return WASI_ERRNO_BADF end
+        if path_len < 0 then return WASI_ERRNO_INVAL end
+        var n = [uint64]([uint32](path_len))
+        var p = [&int8](C.malloc(n + 1))
+        if p == nil then return WASI_ERRNO_IO end
+        Cstr.memcpy([&opaque](p), [&opaque](mem + [uint64]([uint32](path_ptr))), n)
+        p[n] = 0
+        var dirfd = fd
+        var unlink_path = p
+        var need_close_dirfd = false
+        if fd >= 3 and fd < (3 + [n_dirs]) then
+            dirfd = -1
+            var idx = fd - 3
+            escape
+                for i = 1, n_dirs do
+                    local hsrc = dir_host_constants[i]
+                    emit quote
+                        if idx == [i - 1] then
+                            dirfd = Cfcntl.open(&hsrc[0], Cfcntl.O_RDONLY, 0)
+                        end
+                    end
+                end
+            end
+            if dirfd < 0 then
+                C.free(p)
+                return WASI_ERRNO_IO
+            end
+            need_close_dirfd = true
+            if n > 0 and p[0] == 47 then
+                if n == 1 then
+                    unlink_path = &dot_path[0]
+                else
+                    unlink_path = p + 1
+                end
+            end
+        end
+        var rc = Cunistd.unlinkat(dirfd, unlink_path, 0)
+        if need_close_dirfd then Cunistd.close(dirfd) end
+        C.free(p)
+        if rc ~= 0 then return WASI_ERRNO_IO end
+        return 0
+    end
+    wasi[P .. "poll_oneoff"] = terra(in_ptr: int32, out_ptr: int32, nsubs: int32, nevents_ptr: int32) : int32
+        return WASI_ERRNO_NOSYS
+    end
+    wasi[P .. "sock_shutdown"] = terra(fd: int32, how: uint8) : int32
+        if fd < 0 then return WASI_ERRNO_BADF end
+        var chk = Cfcntl.fcntl(fd, Cfcntl.F_GETFD)
+        if chk < 0 then return WASI_ERRNO_BADF end
+        var rc = Csocket.shutdown(fd, [int32](how))
+        if rc == 0 then return 0 end
+        return WASI_ERRNO_NOTSOCK
     end
 
     return wasi
@@ -2685,7 +3312,9 @@ local function compile_module_core(wasm_bytes, host_functions, opts)
         for _, imp in ipairs(mod.imports) do
             if imp.module == "wasi_snapshot_preview1" then
                 local wasi = make_wasi(mod, module_env,
-                    host_functions._wasi_args or {})
+                    host_functions._wasi_args or {},
+                    host_functions._wasi_env or {},
+                    host_functions._wasi_dirs or {})
                 for k, v in pairs(wasi) do
                     if not host_functions[k] then host_functions[k] = v end
                 end

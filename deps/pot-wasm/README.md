@@ -40,7 +40,14 @@ Conformance helpers:
 ./scripts/run_wasi_testsuite.sh
 ```
 
-Current known red areas:
+Current status (latest focused pass):
+- WASI C (`wasm32-wasip1`): passing in full.
+- WASI AssemblyScript (`wasm32-wasip1`): 1 remaining failure:
+  - `environ_get-multiple-variables` (runtime crash, exit `-11`).
+- WASI Rust (`wasm32-wasip1`): broad semantics still incomplete (many expected failures/timeouts when enabled).
+
+Known red areas:
+- `environ_get-multiple-variables`: crash path still under investigation.
 - `conversions.wast`: bit-exact reinterpret + NaN payload semantics.
 - `wat2wasm` parser support gaps in wabt `1.0.34` for newer reference-type syntax used by some suite files.
 
