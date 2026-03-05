@@ -1,3 +1,9 @@
-[submodule "/home/cedric/dev/terroir/deps/terra"]
-	path = /home/cedric/dev/terroir/deps/terra
+[submodule "deps/terra"]
+	path = deps/terra
 	url = https://github.com/terralang/terra.git
+[submodule "deps/pot-wasm/third_party/webassembly-testsuite"]
+	path = deps/pot-wasm/third_party/webassembly-testsuite
+	url = https://github.com/WebAssembly/testsuite.git
+[submodule "deps/pot-wasm/third_party/wasi-testsuite"]
+	path = deps/pot-wasm/third_party/wasi-testsuite
+	url = https://github.com/WebAssembly/wasi-testsuite.git

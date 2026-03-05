@@ -14,7 +14,7 @@ The **runtime layer** is Luvit (LuaJIT on libuv). It handles I/O, HTTP, service 
 
 The **data layer** is DataFusion through its C API. It handles SQL parsing, query planning, predicate pushdown, joins, aggregation, and vectorized execution. It produces Apache Arrow record batches — columnar, typed, zero-copy.
 
-The **compute layer** is compiled WASM modules specialized to native `.so` files. Data filtering beyond SQL, geometry transforms, coordinate reprojection, tile encoding, style evaluation, and template rendering. Called from Luvit through LuaJIT FFI. Pure computation — no I/O, no allocation outside linear memory.
+The **compute layer** is compiled WASM modules instantiated directly in-memory by the Terra runtime. Data filtering beyond SQL, geometry transforms, coordinate reprojection, tile encoding, style evaluation, and template rendering. Called from Luvit through LuaJIT FFI using exported function pointers. Pure computation — no I/O, no allocation outside linear memory.
 
 The critical design: **Arrow is the data format between all three layers.** DataFusion produces Arrow batches. Compiled modules consume Arrow batches. No serialization, no deserialization, no row-to-column conversion. The data is allocated once by DataFusion and read in place through the entire pipeline. Terra generates Arrow-native accessor code from compile-time schemas — direct pointer arithmetic into Arrow's columnar buffers with no Arrow library at runtime.
 
@@ -28,9 +28,9 @@ Luvit (LuaJIT + libuv)
 ├── ffi.C.datafusion_*
 │   SQL queries → Arrow record batches (zero-copy)
 │
-└── ffi.C.pipeline_*
+└── pot-wasm runtime via LuaJIT FFI
+    load wasm bytes -> Terra JIT -> export function pointers
     Arrow batches → GIS output (MVT, PNG, HTML, GeoJSON)
-    compiled from Terra, specialized from WASM
     reads Arrow columns via generated pointer arithmetic
 ```
 
@@ -81,8 +81,8 @@ local n_batches = ffi.new("int[1]")
 df.df_collect(dataframe, batches, schema, n_batches)
 
 -- batches[0] through batches[n_batches-1] are Arrow record batches
--- pass directly to compiled pipeline — zero copy
-local rc = ffi.C.tile_roads_handle(
+-- pass directly to a compiled runtime export pointer — zero copy
+local rc = tile_roads_handle(
   z, x, y,
   batches[0], n_batches[0],  -- Arrow data, no conversion
   out_buf, out_len
@@ -705,10 +705,15 @@ function effects.boot()
   register_sources(df_ctx, graph.data_sources)
 
   for _, entry in ipairs(graph.boot_order) do
-    local lib = ffi.load(entry.so_path)
+    local wasm = assert(read_file(entry.wasm_path))
+    local inst = pot.instantiate(wasm, {
+      _wasi_args = entry.wasi_args or {},
+    }, { eager = true })
+    local ptr = pot.instance_export_ptr(inst, entry.meta.abi.entry_index)
+    local fn = ffi.cast(entry.meta.abi.entry_ffi, ptr)
     services[entry.name] = {
-      lib = lib,
-      fn = lib[entry.meta.abi.entry],
+      inst = inst,
+      fn = fn,
       meta = entry.meta,
       ctx = provision_requirements(entry, df_ctx),
     }
@@ -759,7 +764,7 @@ end
 
 ### 12. Live Hot-Swap
 
-When a module recompiles, the host reads the new module's `terroir` section, validates against the live graph (requirements satisfiable, schemas compatible, routes clean), specializes to `.so`, and atomically swaps:
+When a module recompiles, the host reads the new module's `terroir` section, validates against the live graph (requirements satisfiable, schemas compatible, routes clean), instantiates it in-memory, and atomically swaps:
 
 ```lua
 function effects.hot_swap(wasm_path)
@@ -782,17 +787,24 @@ function effects.hot_swap(wasm_path)
     return false
   end
 
-  -- specialize and swap
-  local so_path = specialize(wasm_path, target_arch())
-  local new_lib = ffi.load(so_path)
+  -- instantiate and swap
+  local wasm = assert(read_file(wasm_path))
+  local new_inst = pot.instantiate(wasm, {
+    _wasi_args = new_meta.wasi_args or {},
+  }, { eager = true })
+  local new_ptr = pot.instance_export_ptr(new_inst, new_meta.abi.entry_index)
+  local new_fn = ffi.cast(new_meta.abi.entry_ffi, new_ptr)
 
   local old = services[name]
   services[name] = {
-    lib = new_lib,
-    fn = new_lib[new_meta.abi.entry],
+    inst = new_inst,
+    fn = new_fn,
     meta = new_meta,
     ctx = reconcile_requirements(old and old.ctx, new_meta.requires),
   }
+  if old and old.inst then
+    pot.instance_deinit(old.inst)
+  end
   update_routes(old and old.meta.provides, new_meta.provides, name)
 
   log.info("hot-swapped '%s'", name)
@@ -895,9 +907,9 @@ Schema-specific protobuf encoding. Tags are constants. Key table is a constant b
 
 For UI endpoints: flat buffer writes for SSR, mount/patch functions for client WASM. The template compiler reads data from Arrow batches using the generated accessors — the same data flows from DataFusion through the template without conversion.
 
-### 15. The WASM Specializer
+### 15. The WASM Runtime Compiler
 
-Already built. Takes `.wasm`, walks bytecode at Terra compile time, emits specialized Terra code per-opcode. First Futamura projection. Output: `.so` with C ABI exports. Performance at or above hand-written C.
+Already built. Takes `.wasm`, walks bytecode at Terra compile time, emits specialized Terra code per-opcode, compiles with Terra/LLVM, and exposes C-ABI function pointers. The runtime memoizes compilation by module/options/import identity. Performance is at or above hand-written C.
 
 ---
 
@@ -937,7 +949,7 @@ The `raster_expr` compiles to a per-pixel Terra function. Raster bands come from
 
 ### 18. User-Defined Pipelines
 
-Users write DSL expressions in the UI. These compile at request time through the same pipeline compiler to sandboxed `.wasm` modules. Filter expressions compile in single-digit milliseconds. The output module reads Arrow data through generated accessors like any other module.
+Users write DSL expressions in the UI. These compile at request time through the same pipeline compiler to sandboxed `.wasm` modules. Filter expressions compile in single-digit milliseconds. The output module is instantiated directly by pot-wasm and reads Arrow data through generated accessors like any other module.
 
 ---
 
@@ -994,14 +1006,14 @@ $ terroir build
 
 $ terroir deploy --target x86_64-linux
 
-[specialize] 7 modules → .so
+[instantiate] 7 modules loaded via pot-wasm runtime
 [boot] DataFusion context: 3 sources registered
 [boot] services loaded in dependency order
 [listen] :8080
 
 $ terroir dev --watch
 
-[watch] pipelines/ — sub-100ms reload, WASM interpreted
+[watch] pipelines/ — sub-100ms reload, runtime re-instantiation
 ```
 
 ### 21. Tooling
@@ -1042,8 +1054,8 @@ Terroir
 │   ├── raster codegen        (per-pixel expressions, SIMD)
 │   └── terroir section       (self-description from same AST)
 │
-├── WASM Specializer                 Terra (already built)
-│   .wasm → .so via first Futamura projection
+├── pot-wasm Runtime                 Terra/Lua (already built)
+│   .wasm -> Terra compile -> C-ABI function pointers
 │
 ├── DataFusion                       Rust, via C API (datafusion-c)
 │   SQL → Arrow record batches
@@ -1064,7 +1076,7 @@ Terroir
 │       re-validates on hot-swap against live graph + Arrow schemas
 │
 ├── Host                             Luvit (LuaJIT + libuv)
-│   HTTP, routing, DataFusion FFI, pipeline FFI, caching, pools
+│   HTTP, routing, DataFusion FFI, pot-wasm FFI, caching, pools
 │
 └── Client Modules                   .wasm served to browser
     Ignis DOM, client-side filter/style, optional DataFusion-WASM
@@ -1080,7 +1092,7 @@ DataFusion (Rust)
         │
         │ ArrowArray* passed via FFI (pointer, no copy)
         ▼
-Compiled Pipeline (Terra → WASM → .so)
+Compiled Pipeline (WASM -> pot-wasm -> Terra native pointers)
     reads Arrow columns via generated pointer arithmetic
     filters, clips, simplifies, reprojects, styles, encodes
     writes output bytes to caller-provided buffer

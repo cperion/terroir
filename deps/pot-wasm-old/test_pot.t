@@ -1,5 +1,6 @@
 -- POT test harness
 local POT = require("pot")
+local ffi = require("ffi")
 
 local passed, failed, total = 0, 0, 0
 
@@ -432,6 +433,47 @@ test("br_table dispatch", function()
 end)
 
 ------------------------------------------------------------------------
+print("\n=== M11: Runtime instance API ===")
+------------------------------------------------------------------------
+
+test("instantiate export enumeration + ptr call", function()
+    local bytes = wat2wasm([[
+        (module
+          (func (export "add") (param i32 i32) (result i32)
+            local.get 0
+            local.get 1
+            i32.add))
+    ]])
+    local inst = POT.instantiate(bytes, {}, { eager = true })
+    assert_eq(POT.instance_export_count(inst), 1, "export count")
+    assert_eq(POT.instance_export_name(inst, 0), "add", "export name[0]")
+    local sig, err = POT.instance_export_sig(inst, 0)
+    assert_eq(err, nil, "export sig error")
+    assert_eq(sig, "int32_t(*)(int32_t, int32_t)", "export sig")
+    local ptr = POT.instance_export_ptr(inst, 0)
+    assert(ptr ~= nil, "export ptr")
+    local add = ffi.cast(sig, ptr)
+    assert_eq(add(40, 2), 42, "ptr call")
+    POT.instance_deinit(inst)
+end)
+
+test("instance init/deinit memory lifecycle", function()
+    local bytes = wat2wasm([[
+        (module
+          (memory 1)
+          (func (export "load0") (result i32)
+            i32.const 0
+            i32.load))
+    ]])
+    local inst = POT.instantiate(bytes, {}, { init = false })
+    assert_eq(POT.instance_memory_size(inst), 0, "memory size before init")
+    POT.instance_init(inst)
+    assert(POT.instance_memory_size(inst) >= 65536, "memory size after init")
+    assert(POT.instance_memory(inst) ~= nil, "memory ptr after init")
+    POT.instance_deinit(inst)
+    assert_eq(POT.instance_memory_size(inst), 0, "memory size after deinit")
+end)
+
 print(string.format("\n=== Results: %d/%d passed ===", passed, total))
 if failed > 0 then
     print(string.format("    %d FAILED", failed))
