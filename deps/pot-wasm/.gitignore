@@ -1,0 +1,26 @@
+# Compiled files
+*.o
+*.so
+*.dylib
+*.dll
+
+# Temp files
+*.tmp
+*.bak
+*~
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts
+build/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terra cache
+.terra_cache/

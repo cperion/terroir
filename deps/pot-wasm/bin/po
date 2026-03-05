@@ -1,0 +1,4 @@
+#!/bin/sh
+# POT-WASM runner
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec terra "$SCRIPT_DIR/../pot_run.t" "$@"
